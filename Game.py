@@ -133,47 +133,6 @@ class Game:
         else:
             print("\nDeck and playing stack are empty. Cannot replenish.")
 
-    # def play_turn(self, player):
-    #     print(f"\n{player.name}'s turn. Top card: {self.get_top_card()}")
-    #     cards_played = player.play_cards(self.get_top_card())
-    #
-    #     if cards_played:
-    #         for card in cards_played:
-    #             self.playing_stack.append(card)
-    #         print(f"{player.name} plays: {', '.join(map(str, cards_played))}")
-    #
-    #         # Handle extended draw rules for 2, 5, and J
-    #         if cards_played[0].rank == '2':
-    #             forced_draws = 2 * len(cards_played)
-    #             print(f"Rule triggered: Next player must draw {forced_draws} cards!")
-    #             return forced_draws
-    #
-    #         elif cards_played[0].rank == '5':
-    #             forced_draws = 3 * len(cards_played)
-    #             print(f"Rule triggered: Next player must draw {forced_draws} cards!")
-    #             return forced_draws
-    #
-    #         elif cards_played[0].rank == 'J':
-    #             forced_draws = len(cards_played)
-    #             print(f"Rule triggered: All other players must draw {forced_draws} cards!")
-    #             for p in self.players:
-    #                 if p != player:
-    #                     for _ in range(forced_draws):
-    #                         p.draw_card(self.deck, self)
-    #             return 0  # No need for further handling
-    #         elif cards_played[0].rank == '8':
-    #             skips = len(cards_played)
-    #             print(f"Rule triggered: Next {skips} player(s) will miss their turn!")
-    #             return -skips  # Negative return value signifies number of skipped turns
-    #
-    #     else:
-    #         new_card = player.draw_card(self.deck, self)
-    #         if new_card:
-    #             print(f"{player.name} has no playable card. Draws {new_card}")
-    #         else:
-    #             print(f"{player.name} has no playable card and the deck is empty.")
-    #     return 0  # No forced draw
-
     def play_turn(self, player):
         top_card = self.get_top_card()
         if not top_card:
@@ -234,36 +193,6 @@ class Game:
 
     def get_loser(self):
         return max(self.players, key=lambda p: p.hand_value())
-
-    # def start(self):
-    #     current_player = 0
-    #     while True:
-    #         player = self.players[current_player]
-    #         result = self.play_turn(player)
-    #
-    #         if result > 0:  # Forced draws (2 or 5)
-    #             next_player_index = (current_player + 1) % len(self.players)
-    #             next_player = self.players[next_player_index]
-    #             print(f"{next_player.name} must draw {result} cards!")
-    #             for _ in range(result):
-    #                 next_player.draw_card(self.deck, self)
-    #
-    #         elif result < 0:  # Skip turns (8s)
-    #             skips = -result
-    #             print(f"Skipping next {skips} player(s)...")
-    #             current_player = (current_player + skips) % len(self.players)
-    #
-    #         sleep(0.8)
-    #
-    #         winner = self.check_winner()
-    #         if winner:
-    #             print(f"\n ---------- We have a winner -----------\n {winner.name} wins")
-    #             loser = self.get_loser()
-    #             print(f" -__- {loser.name} lost the game with a total card value of {loser.hand_value()}")
-    #             break
-    #
-    #         else:
-    #             current_player = (current_player + 1) % len(self.players)
 
     def start(self):
         current_player = 0
