@@ -1,5 +1,11 @@
-from cgitb import handler
 from time import sleep
+from collections import deque
+import random
+import torch
+import torch.nn as nn
+import numpy as np
+from sympy.physics.units import action
+
 
 class Card:
     def __init__(self, suit, rank):
@@ -27,9 +33,6 @@ class Card:
             return int(self.rank)
 
 
-import random
-
-
 class Deck:
     def __init__(self):
         suits = ['Hearts', 'Diamonds', 'Clubs', 'Spades']
@@ -49,6 +52,7 @@ class Player:
     def __init__(self, name):
         self.name = name
         self.hand = []
+        self.can_play = []
 
     def draw_card(self, deck, game):
         if deck.is_empty():
@@ -100,6 +104,195 @@ class Player:
 
     def has_cards(self):
         return len(self.hand) > 0
+
+class SimpleRLPlayer(Player):
+    def __init__(self, name, epsilon=0.1, alpha=0.1, gamma=0.9):
+        super().__init__(name)
+        self.q_table = {}  # Dictionary: state -> {action: q_value}
+        self.epsilon = epsilon  # Exploration rate
+        self.alpha = alpha      # learning rate
+        self.gamma = gamma      # discount factor
+        self.last_state = None
+        self.last_action = None
+
+    def can_play_card(self, card, top_card):
+        """Check if a single card can be played"""
+        if not top_card:
+            return True  # Any card can be played if there is no top card
+
+        if card.rank == 'Joker':
+            return True  # Joker can be played on any card
+
+        if top_card.rank == 'Joker':
+            return True  # Any card can be played on a Joker
+
+        return (
+            card.suit == top_card.suit or
+            card.rank == top_card.rank or
+            card.rank == 'Joker'
+        )
+
+    def get_playable_cards(self, top_card):
+        """Get all cards that can be played individually"""
+        playable = []
+        for card in self.hand:
+            if self.can_play_card(card, top_card):
+                playable.append(card)
+
+        return playable
+
+    def get_valid_actions(self, top_card):
+        """Get all possible actions (sets of cards to play)"""
+        actions = []
+
+        # 1. check for multiple cards of the same rank
+        rank_groups = {}
+        for card in self.hand:
+            rank_groups.setdefault(card.rank, []).append(card)
+
+        # Add actions for playing all cards of the same rank
+        for rank, cards in rank_groups.items():
+            if len(cards) > 1:
+                # Check if at least one card in the group is playable
+                for card in cards:
+                    if self.can_play_card(card, top_card):
+                        actions.append(tuple(sorted(cards, key=lambda c: str(c))))  # might not need to sort the cards
+
+        # 2. add single card playing actions
+        for card in self.hand:
+            if self.can_play_card(card, top_card):
+                actions.append(tuple(card))
+
+        # 3. Add a draw card action represented by and empty tuple
+        actions.append(())
+
+        return actions
+
+    def get_state_key(self, game):
+        """Create a simplified state representation for the Q-table"""
+        top_card = game.get_top_card()
+
+        # Count the playable cards
+        playable_cards = self.get_playable_cards(top_card)
+        num_playable = len(playable_cards)
+
+        # check for special cards in the hand
+        has_joker = any(card.rank == 'Joker' for card in self.hand)
+        has_special = any(card.rank in ['2', '5', '8', 'J'] for card in self.hand)
+
+        # Opponent hand sizes
+        opponent_hand_sizes = tuple(sorted(
+            len(p.hand) for p in game.players if p != self
+        ))
+
+        # create the state key
+        state_key = (
+            len(self.hand),                         # Player hand size
+            num_playable,                           # number of playable cards in player hand
+            1 if has_joker else 0,                  # has joker
+            1 if has_special else 0,                # has a special card
+            top_card.rank if top_card else None,    # top card rank
+            opponent_hand_sizes,                    # hand sizes of the opponents
+            len(game.deck.cards) > 10,              # deck has cards
+        )
+
+        return state_key
+
+    def choose_action(self, game):
+        """Choose action to take using epsilon-greedy Q-learning"""
+        state = self.get_state_key(game)
+        actions = self.get_valid_actions(game.get_top_card())
+
+        # Initialize Q-values for new state
+        # this implementation means that the state has to match the previous exactly before any update occurs
+        # the q-table will be very robust
+        if state not in self.q_table:
+            self.q_table[state] = {action: 0.0 for action in actions} # getting actions available for this particular state
+
+        # Add any new actions that might not be in the Q-table
+        # not sure why we would need to add them again TODO: ask Deepseek why
+        for action in actions:
+            if action not in self.q_table[state]:
+                self.q_table[state][action] = 0.0
+
+        # Epsilon-greedy action selection
+        if random.random() < self.epsilon:
+            # explore random actions
+            action = random.choice(actions)
+        else:
+            # Exploit: choose action with the highest Q-value
+            max_q = max(self.q_table[state].values())
+            best_actions = [a for a, q in self.q_table[state].items()
+                            if q == max_q and a in actions]
+            action = random.choice(best_actions) if best_actions else random.choice(actions)
+
+        return action
+
+    def execute_action(self, action, game):
+        """Execute the chosen action in the game"""
+        top_card = game.get_top_card()
+
+        if action == ():
+            card_drawn = self.draw_card(game.deck, game)
+            if card_drawn:
+                print(f"{self.name} chooses to draw {card_drawn}")
+            return 0  # no forced draws from drawing
+
+        # Play cards
+        for card in action:
+            if card in self.hand:
+                self.hand.remove(card)
+                game.playing_stack.append(card)
+
+        print(f"{self.name} plays: {', '.join(str(c) for c in action)}")
+
+        # Handle special card effects
+        if action[0].rank == '2':
+            return 2 * len(action)
+        elif action[0].rank == '5':
+            return 3 * len(action)
+        elif action[0].rank == 'J':
+            forced_draws = len(action)
+            for p in game.players:
+                if p != self:
+                    for _ in range(forced_draws):
+                        p.draw_card(game.deck, game)
+            return 0
+        elif action[0].rank == '8':
+            return -len(action)
+
+        return 0
+
+    def learn(self, state, action, reward, next_state, game):
+        """Update Q-table using q-learning"""
+        if state not in self.q_table:
+            return
+
+        # Get max Q-value for next state
+        next_max_q = 0
+        if next_state in self.q_table and self.q_table[next_state]:
+            next_actions = self.get_valid_actions(game.get_top_card())
+            valid_q_values = [
+                self.q_table[next_state].get(a, 0) for a in next_actions if a in self.q_table[next_state]
+            ]
+            next_max_q = max(valid_q_values) if valid_q_values else 0
+
+        # Q-learning update
+        # Q-values are calculated here
+        old_q = self.q_table[state].get(action, 0)
+        self.q_table[state][action] = old_q + self.alpha * (
+            reward + self.gamma * next_max_q - old_q
+        )
+
+    def update(self, game, reward):
+        """Called after an action is executed"""
+        if self.last_state is not None and self.last_action is not None:
+            next_state = self.get_state_key(game)
+            self.learn(self.last_state, self.last_action, reward, next_state, game)
+
+        # Store current state/action for next update
+        self.last_state = self.get_state_key(game)
+        self.last_action = self.choose_action(game) if self.hand else None
 
 
 class Game:

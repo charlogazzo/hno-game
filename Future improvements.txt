@@ -1,0 +1,2 @@
+Alter the gameplay to allow the Reinforcement Learning player to make a mistake and pick two cards for the mistake
+then observe how it learns
