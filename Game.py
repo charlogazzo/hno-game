@@ -1,10 +1,11 @@
 from time import sleep
 from collections import deque
+from collections import defaultdict
 import random
+import pickle
 import torch
 import torch.nn as nn
 import numpy as np
-from sympy.physics.units import action
 
 
 class Card:
@@ -53,6 +54,9 @@ class Player:
         self.name = name
         self.hand = []
         self.can_play = []
+
+    def __eq__(self, other):
+        return other.name == self.name
 
     def draw_card(self, deck, game):
         if deck.is_empty():
@@ -105,15 +109,23 @@ class Player:
     def has_cards(self):
         return len(self.hand) > 0
 
+def create_default_dict():
+    return defaultdict(float)
+
+def create_default_q_table():
+    return defaultdict(create_default_dict)
+
 class SimpleRLPlayer(Player):
     def __init__(self, name, epsilon=0.1, alpha=0.1, gamma=0.9):
         super().__init__(name)
-        self.q_table = {}  # Dictionary: state -> {action: q_value}
+        self.q_table = create_default_q_table()  # Dictionary: state -> {action: q_value}
         self.epsilon = epsilon  # Exploration rate
         self.alpha = alpha      # learning rate
         self.gamma = gamma      # discount factor
         self.last_state = None
         self.last_action = None
+        self.total_reward = 0
+        self.memory = []
 
     def can_play_card(self, card, top_card):
         """Check if a single card can be played"""
@@ -161,7 +173,7 @@ class SimpleRLPlayer(Player):
         # 2. add single card playing actions
         for card in self.hand:
             if self.can_play_card(card, top_card):
-                actions.append(tuple(card))
+                actions.append((card,))
 
         # 3. Add a draw card action represented by and empty tuple
         actions.append(())
@@ -176,9 +188,24 @@ class SimpleRLPlayer(Player):
         playable_cards = self.get_playable_cards(top_card)
         num_playable = len(playable_cards)
 
+        # Bucket hand size (instead of exact count)
+        hand_size_bucket = self._bucket_hand_size(len(self.hand))
+
+        # Bucket playable cards
+        playable_bucket = self._bucket_playable(num_playable)
+
         # check for special cards in the hand
         has_joker = any(card.rank == 'Joker' for card in self.hand)
         has_special = any(card.rank in ['2', '5', '8', 'J'] for card in self.hand)
+
+        # Bucket opponent threat level (instead of exact hand sizes)
+        opponent_threat = self._bucket_opponent_threat(game)
+
+        # Simplify top card rank to categories
+        top_card_category = self._categorize_top_card(top_card)
+
+        # Deck status (more generous bucketing)
+        deck_status = self._bucket_deck_status(len(game.deck.cards))
 
         # Opponent hand sizes
         opponent_hand_sizes = tuple(sorted(
@@ -187,13 +214,13 @@ class SimpleRLPlayer(Player):
 
         # create the state key
         state_key = (
-            len(self.hand),                         # Player hand size
-            num_playable,                           # number of playable cards in player hand
-            1 if has_joker else 0,                  # has joker
-            1 if has_special else 0,                # has a special card
-            top_card.rank if top_card else None,    # top card rank
-            opponent_hand_sizes,                    # hand sizes of the opponents
-            len(game.deck.cards) > 10,              # deck has cards
+            hand_size_bucket,                   # Player hand size
+            playable_bucket,                    # number of playable cards in player hand
+            1 if has_joker else 0,              # has joker
+            1 if has_special else 0,            # has a special card
+            top_card_category,                  # top card rank
+            opponent_threat,                    # hand sizes of the opponents
+            deck_status,                        # deck has cards
         )
 
         return state_key
@@ -284,6 +311,27 @@ class SimpleRLPlayer(Player):
             reward + self.gamma * next_max_q - old_q
         )
 
+    def learn_from_step(self, reward, game):
+        """Update Q-table based on last action"""
+        if self.last_state is not None and self.last_action is not None:
+            current_state = self.get_state_key(game)
+
+            # Get max Q-value for current state
+            next_max_q = 0
+            if current_state in self.q_table and self.q_table[current_state]:
+                next_max_q = max(self.q_table[current_state].values())
+
+            # Q-learning update
+            old_q = self.q_table[self.last_state][self.last_action]
+            new_q = old_q + self.alpha * (reward + self.gamma * next_max_q - old_q)
+            self.q_table[self.last_state][self.last_action] = new_q
+
+            # Store for next update
+            self.last_state = current_state
+            self.last_action = None
+
+        self.total_reward += reward
+
     def update(self, game, reward):
         """Called after an action is executed"""
         if self.last_state is not None and self.last_action is not None:
@@ -293,6 +341,65 @@ class SimpleRLPlayer(Player):
         # Store current state/action for next update
         self.last_state = self.get_state_key(game)
         self.last_action = self.choose_action(game) if self.hand else None
+
+    def _bucket_hand_size(self, hand_size):
+        """Bucket hand size into categories"""
+        if hand_size <= 2:
+            return "critical"  # Very few cards - close to winning!
+        elif hand_size <= 5:
+            return "low"
+        elif hand_size <= 8:
+            return "medium"
+        else:
+            return "high"
+
+    def _bucket_playable(self, num_playable):
+        """Bucket number of playable cards"""
+        if num_playable == 0:
+            return "none"
+        elif num_playable == 1:
+            return "one"
+        elif num_playable <= 3:
+            return "few"
+        else:
+            return "many"
+
+    def _bucket_opponent_threat(self, game):
+        """Assess opponent threat level based on their hand sizes"""
+        opponent_hand_sizes = [len(p.hand) for p in game.players if p != self]
+
+        if not opponent_hand_sizes:
+            return "safe"
+
+        min_opponent_cards = min(opponent_hand_sizes)
+
+        if min_opponent_cards <= 2:
+            return "critical"  # Someone is about to win!
+        elif min_opponent_cards <= 4:
+            return "danger"
+        else:
+            return "safe"
+
+    def _categorize_top_card(self, top_card):
+        """Categorize the top card into broader groups"""
+        if not top_card:
+            return None
+
+        if top_card.rank in ['2', '5', '8', 'J', 'Joker']:
+            return "special"
+        elif top_card.rank in ['K', 'Q']:
+            return "high"
+        else:
+            return "low"
+
+    def _bucket_deck_status(self, deck_size):
+        """Bucket deck size"""
+        if deck_size > 20:
+            return "plenty"
+        elif deck_size > 5:
+            return "low"
+        else:
+            return "critical"
 
 
 class Game:
@@ -430,6 +537,447 @@ class Game:
             current_player = (current_player + 1) % len(self.players)
 
 
+class RLGame(Game):
+    def __init__(self, player_names, use_rl=False):
+        super().__init__(player_names)
+
+        self.use_rl = use_rl
+
+        # if use_rl:
+        #     # Replace players with RL versions
+        #     self.players = [SimpleRLPlayer(name) for name in player_names]
+        #     # Deal cards to RL players
+        #     for player in self.players:
+        #         for _ in range(4):
+        #             card = self.deck.draw()
+        #             if card:
+        #                 player.hand.append(card)
+
+    # def play_turn(self, player):
+    #     top_card = self.get_top_card()
+    #     # TODO: adjust implementation for is a player's name ends with 's'
+    #     print(f"\n{player.name}'s turn. Top card: {top_card}")
+    #     print(f"Hand: {player.hand}")
+    #
+    #     if isinstance(player, SimpleRLPlayer):
+    #         # RL player chooses action
+    #         action = player.choose_action(self)
+    #         result = player.execute_action(action, self)
+    #
+    #         # calculate reward for the RL player
+    #         reward = self.calculate_reward(player, action, result)
+    #         player.update(self, reward)
+    #
+    #     else:
+    #         # Original non-RL player behaviour
+    #         result = super().play_turn(player)
+    #
+    #     return result
+
+    def play_turn(self, player):
+        """Tracks rewards for RL players"""
+        if isinstance(player, SimpleRLPlayer):
+            return self.play_rl_turn(player)
+        else:
+            return super().play_turn(player)
+
+    def play_rl_turn(self, player):
+        """Special turn handling for RL agents with reward tracking"""
+        top_card = self.get_top_card()
+        if not top_card:
+            # Initialize if needed
+            card = self.deck.draw()
+            if card:
+                self.playing_stack.append(card)
+                top_card = card
+
+        print(f"  {player.name}'s turn. Top: {top_card}, Hand: {len(player.hand)} cards")
+
+        # RL agent chooses and executes action
+        action = player.choose_action(self)
+        result = player.execute_action(action, self)
+
+        # Calculate immediate reward
+        reward = self.calculate_immediate_reward(player, action, result)
+
+        # Update Q-learning
+        current_state = player.get_state_key(self)
+        player.learn_from_step(reward, self)
+
+        return result
+        
+
+    def calculate_reward(self, player, action, result):
+        """Calculate reward for the RL player"""
+        reward = 0
+
+        # Positive reward
+        if action != ():
+            reward += 1.0
+            if len(action) > 1.0:
+                reward += 1.0
+            if action[0].rank in ['2', '5', '8', 'J', 'Joker']:
+                reward += 2.0
+
+        # Negative rewards
+        if action == ():
+            reward -= 0.5
+
+        # Check for win
+        if not player.has_cards():
+            reward += 100.0
+
+        # Penalty for high hand value
+        # TODO: look to adjust this
+        reward -= player.hand_value() * 0.01
+
+        return reward
+
+    def calculate_immediate_reward(self, player, action, result):
+        """Calculate reward for RL agent's action"""
+        reward = 0
+
+        if action == ():  # Drew a card
+            reward -= 0.3
+        else:  # Played cards
+            reward += 0.5
+
+            # Bonus for playing multiple cards
+            if len(action) > 1:
+                reward += 0.5
+
+            # Bonus for special cards
+            if action[0].rank in ['2', '5', '8', 'J', 'Joker']:
+                reward += 1.0
+
+            # Big bonus for winning move
+            if len(player.hand) == len(action):  # Played last cards
+                reward += 10.0
+
+        return reward
+
+class RLTrainingSystem:
+    def __init__(self):
+        self.agent = None
+        self.training_stats = []
+        self.learning_curve = []
+
+    def train_agent(self, num_episodes=100):
+        """Train an RL agent over multiple episodes"""
+        print("\n---------- Starting RL training -----------\n")
+
+        self.agent = SimpleRLPlayer("RL_Learner", epsilon=0.3, alpha=0.2, gamma=0.95)
+
+        for episode in range(num_episodes):
+            print(f"\n=== Training episode {episode + 1}/{num_episodes} (ε={self.agent.epsilon:.3f}) ===")
+
+            # Create new game with the SAME agent
+            game = RLGame(["RL_Learner", "Bob", "Charles", "Derrick"], use_rl=False)
+
+            # Replace the first player with our RL agent
+            game.players[0] = self.agent
+
+            # Ensure the agent's hand is empty and ready for new game
+            self.agent.hand = []
+
+            # Deal cards to the agent (bypassing the normal draw method)
+            for _ in range(4):
+                card = game.deck.draw()
+                if card:
+                    self.agent.hand.append(card)
+
+            winner = self.play_episode(game, episode + 1)
+
+            # Record statistics
+            won = winner is not None and winner.name == "RL_Learner"
+            self.training_stats.append({
+                'episode': episode + 1,
+                'won': won,
+                'winner': winner.name if winner else 'Draw',
+                'epsilon': self.agent.epsilon,
+                'q_table_size': len(self.agent.q_table),
+                'final_hand_size': len(self.agent.hand),
+                'total_reward': self.agent.total_reward if hasattr(self.agent, 'total_reward') else 0
+            })
+
+            # Update learning curve (moving average of win rate)
+            # TODO: ask why we wait until 10 episodes
+            if len(self.training_stats) >= 10:
+                recent_wins = sum(1 for s in self.training_stats[-10:] if s['won'])
+                self.learning_curve.append(recent_wins / 10)
+
+            # Decay exploration rate
+            self.agent.epsilon = max(0.05, self.agent.epsilon * 0.99)
+
+            # Reset agent's episodic memory (but keep the Q-table)
+            self.agent.last_state = None
+            self.agent.last_action = None
+            self.agent.total_reward = 0
+
+            # Show progress every 10 episodes
+            if (episode + 1) % 10 == 0:
+                self.show_progress(episode + 1)
+
+    def play_episode(self, game, episode_num):
+        """Play one complete game episode"""
+        current_player = 0
+        skip_count = 0
+        turn_count = 0
+
+        # Track if our agent made a move this turn (for reward calculation)
+        agent_made_move = False
+
+        while True:
+            player = game.players[current_player]
+
+            # skip handling
+            if skip_count > 0:
+                skip_count -= 1
+                current_player = (current_player + 1) % len(game.players)
+                continue
+
+            turn_count += 1
+
+            # Check if it's our agent's turn
+            is_agent_turn = (player == self.agent)
+
+            if is_agent_turn:
+                print(f"   Agent's turn #{turn_count}: {len(player.hand)} cards")
+                agent_made_move = True
+
+            # play the turn
+            # result variable stores if there will be a forced draw for the next player
+            result = game.play_turn(player)
+
+            # Check for winner
+            winner = game.check_winner()
+            if winner:
+                print(f"  !! Winner after {turn_count} turns: {winner.name}")
+                return winner
+
+            if turn_count > 200:
+                print(f"  Game terminated after {turn_count} turns (too long)")
+                return None
+
+            if game.deck.is_empty() and len(game.playing_stack) <= 1:
+                print("  !! No more cards available")
+
+            # Handle special card results
+            if result > 0: # Forced draws
+                next_idx = (current_player + 1) % len(game.players)
+                next_player = game.players[next_idx]
+                if is_agent_turn: # Agent forced opponent to draw
+                    self.agent.total_reward += 0.5 * result # Bonus for forcing draws
+                print(f"  {next_player.name} draws {result} cards!")
+                for _ in range(result):
+                    next_player.draw_card(game.deck, game)
+                current_player = next_idx
+
+            elif result < 0: # skip turns
+                skip_count = -result - 1
+                if is_agent_turn:  # Agent made opponent skip turns
+                    self.agent.total_reward += 0.3 * (-result)
+                current_player = (current_player + 1) % len(game.players)
+
+            else:
+                current_player = (current_player + 1) % len(game.players)
+
+            # Give a small reward for surviving the round
+            if is_agent_turn and agent_made_move:
+                self.agent.total_reward += 0.1
+                agent_made_move = False
+
+    def show_progress(self, episode):
+        """Display training progress"""
+        if len(self.training_stats) < 10:
+            return
+
+        recent = self.training_stats[-10:]
+        wins = sum(1 for s in recent if s['won'])
+
+        print(f"\n{'=' * 50}")
+        print(f" --- Training progress after {episode} episodes ---")
+        print(f"\n{'=' * 50}")
+        print(f"Win rate (last 10): {wins}/10 = {wins * 10}%")
+        print(f"Exploration rate (ε): {self.agent.epsilon:.3f}")
+        print(f"Learned states: {len(self.agent.q_table)}")
+
+        # Show Q-Table sample if small enough
+        if len(self.agent.q_table) < 20:
+            print(f"\n Sample Q-values:")
+            for i, (state, actions) in enumerate(list(self.agent.q_table.items())[:5]):
+                print(f"        State {state}:")
+                for action, q in list(actions.items())[:3]:
+                    print(f"         {action}: {q:.2f}")
+
+    def save_agent(self, filename="trained_card_player.pkl"):
+        """Save the trained agent to file - FIXED VERSION"""
+        # Convert defaultdict to regular dict for pickling
+        if self.agent and hasattr(self.agent, 'q_table'):
+            # Convert nested defaultdict to regular dict
+            q_table_dict = {}
+            for state, actions in self.agent.q_table.items():
+                q_table_dict[state] = dict(actions)
+            self.agent.q_table = q_table_dict
+
+        # Save the data
+        data = {
+            'agent': self.agent,
+            'training_stats': self.training_stats,
+            'learning_curve': self.learning_curve,
+            'agent_class': 'SimpleRLPlayer'  # Store class info
+        }
+
+        with open(filename, 'wb') as f:
+            pickle.dump(data, f)
+        print(f"💾 Agent saved to {filename}")
+
+        # Restore defaultdict structure if needed
+        if self.agent and hasattr(self.agent, 'q_table'):
+            self.agent.q_table = create_default_q_table()
+            for state, actions in q_table_dict.items():
+                self.agent.q_table[state].update(actions)
+
+    def load_agent(self, filename="trained_card_player.pkl"):
+        """Load a trained agent from file - FIXED VERSION"""
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+
+        self.agent = data['agent']
+        self.training_stats = data.get('training_stats', [])
+        self.learning_curve = data.get('learning_curve', [])
+
+        # Convert loaded dict back to defaultdict structure
+        if self.agent and hasattr(self.agent, 'q_table'):
+            q_table_dict = self.agent.q_table
+            self.agent.q_table = create_default_q_table()
+            for state, actions in q_table_dict.items():
+                self.agent.q_table[state].update(actions)
+
+        print(f"📂 Agent loaded from {filename}")
+        print(f"   States learned: {len(self.agent.q_table)}")
+        return self.agent
+
+    def analyze_learning(self):
+        """Analyze what the agent learned"""
+        if not self.training_stats:
+            print("No training data to analyze")
+            return
+
+        print(f"\n{'=' * 60}")
+        print("🧠 Learning Analysis Report")
+        print(f"{'=' * 60}")
+
+        # Calculate win rates in different phases
+        total_episodes = len(self.training_stats)
+        quarter = total_episodes // 4
+
+        phases = [
+            ("First 25%", self.training_stats[:quarter]),
+            ("Second 25%", self.training_stats[quarter:2 * quarter]),
+            ("Third 25%", self.training_stats[2 * quarter:3 * quarter]),
+            ("Final 25%", self.training_stats[3 * quarter:])
+        ]
+
+        for phase_name, phase_stats in phases:
+            if phase_stats:
+                wins = sum(1 for s in phase_stats if s['won'])
+                total = len(phase_stats)
+                win_rate = (wins / total) * 100 if total > 0 else 0
+                print(f"{phase_name}: {wins}/{total} wins ({win_rate:.1f}%)")
+
+        # Show final Q-table statistics
+        print(f"\n📊 Final Knowledge Base:")
+        print(f"  Total states learned: {len(self.agent.q_table)}")
+
+        # Count actions per state
+        actions_per_state = [len(actions) for actions in self.agent.q_table.values()]
+        if actions_per_state:
+            avg_actions = sum(actions_per_state) / len(actions_per_state)
+            print(f"  Average actions per state: {avg_actions:.1f}")
+
+        # Show highest Q-values
+        print(f"\n🏆 Best Learned Strategies:")
+        high_q_states = sorted(
+            self.agent.q_table.items(),
+            key=lambda x: max(x[1].values()) if x[1] else 0,
+            reverse=True
+        )[:3]
+
+        for state, actions in high_q_states:
+            if actions:
+                best_action = max(actions.items(), key=lambda x: x[1])
+                print(f"  State {state[:3]}... -> {best_action[0]}: Q={best_action[1]:.2f}")
+
+
+# if __name__ == '__main__':
+#     # Train RL agent against rule-based players
+#     game = RLGame(['RL_agent', 'Bob', 'Charles', 'Derrick'], use_rl=True)
+#
+#     # Train for multiple episodes
+#     for episode in range(100):
+#         print(f"\n=== Episode {episode + 1} ===")
+#         game.start()
+#
+#         # Reset game for next episode
+#         if episode < 99:
+#             game = RLGame(['RL_agent', 'Bob', 'Charles', 'Derrick'], use_rl=True)
+#
+#     # Test trained agent
+#     print("\n=== Testing trained agent ===")
+#     test_game = RLGame(['Trained_RL', 'Bob', 'Charles', 'Derrick'], use_rl=True)
+#     test_game.start()
+
+
+# if __name__ == "__main__":
+#     game = Game(["Alice", "Bob", "Charles", "Derrick"])
+#     game.start()
+
 if __name__ == "__main__":
-    game = Game(["Alice", "Bob", "Charles", "Derrick"])
-    game.start()
+    # ========== TRAINING PHASE ==========
+    print("🤖 CARD GAME RL TRAINING SYSTEM")
+    print("=" * 50)
+
+    trainer = RLTrainingSystem()
+
+    # Train for 100 episodes
+    trainer.train_agent(num_episodes=100)
+
+    # Save the trained agent
+    trainer.save_agent("trained_card_player.pkl")
+
+    # Analyze learning
+    trainer.analyze_learning()
+
+    # ========== TESTING PHASE ==========
+    print("\n" + "=" * 50)
+    print("🧪 FINAL TEST WITH TRAINED AGENT")
+    print("=" * 50)
+
+    # Create a fresh game
+    test_game = Game(["RL_Learner", "Expert_Bob", "Smart_Charlie", "Quick_Derrick"])
+
+    # Load the trained agent
+    trained_agent = trainer.load_agent("trained_card_player.pkl")
+    trained_agent.name = "RL_Learner"
+    trained_agent.epsilon = 0.9  # Minimal exploration for testing
+
+    # Replace first player with trained agent
+    test_game.players[0] = trained_agent
+
+    # Reset agent's hand and deal fresh cards
+    trained_agent.hand = []
+    for _ in range(4):
+        card = test_game.deck.draw()
+        if card:
+            trained_agent.hand.append(card)
+
+    # Play the test match
+    print("\n🎮 Starting Final Test Match...")
+    test_game.start()
+
+    # Show agent's performance
+    print(f"\n📊 Trained Agent Final Stats:")
+    print(f"  Final hand size: {len(trained_agent.hand)}")
+    print(f"  Hand value: {trained_agent.hand_value()}")
+    print(f"  Total Q-table states: {len(trained_agent.q_table)}")
