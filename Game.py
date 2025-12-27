@@ -115,6 +115,11 @@ def create_default_dict():
 def create_default_q_table():
     return defaultdict(create_default_dict)
 
+# Action constants
+ACTION_DRAW = "DRAW"
+ACTION_PLAY_SINGLE = "PLAY_SINGLE"
+ACTION_PLAY_STACK = "PLAY_STACK"
+
 class SimpleRLPlayer(Player):
     def __init__(self, name, epsilon=0.1, alpha=0.1, gamma=0.9):
         super().__init__(name)
@@ -164,19 +169,18 @@ class SimpleRLPlayer(Player):
 
         # Add actions for playing all cards of the same rank
         for rank, cards in rank_groups.items():
-            if len(cards) > 1:
+            if len(cards) >= 2:
                 # Check if at least one card in the group is playable
-                for card in cards:
-                    if self.can_play_card(card, top_card):
-                        actions.append(tuple(sorted(cards, key=lambda c: str(c))))  # might not need to sort the cards
+                if any(self.can_play_card(card, top_card) for card in cards):
+                    actions.append((ACTION_PLAY_STACK, rank, len(cards)))
 
         # 2. add single card playing actions
-        for card in self.hand:
-            if self.can_play_card(card, top_card):
-                actions.append((card,))
+        for rank, cards in rank_groups.items():
+            if any(self.can_play_card(card, top_card) for card in cards):
+                actions.append((ACTION_PLAY_SINGLE, rank))
 
         # 3. Add a draw card action represented by and empty tuple
-        actions.append(())
+        actions.append((ACTION_DRAW,))
 
         return actions
 
@@ -259,36 +263,35 @@ class SimpleRLPlayer(Player):
         """Execute the chosen action in the game"""
         top_card = game.get_top_card()
 
-        if action == ():
+        action_type = action[0]
+
+        if action_type == ACTION_DRAW:
             card_drawn = self.draw_card(game.deck, game)
             if card_drawn:
                 print(f"{self.name} chooses to draw {card_drawn}")
             return 0  # no forced draws from drawing
 
-        # Play cards
-        for card in action:
-            if card in self.hand:
+        if action_type == ACTION_PLAY_SINGLE:
+            _, rank = action
+            card = next(c for c in self.hand if c.rank == rank)
+
+            self.hand.remove(card)
+            game.playing_stack.append(card)
+
+            print(f"{self.name} plays {card}")
+            return  self._handle_special(card, game)
+
+        if action_type == ACTION_PLAY_STACK:
+            _, rank, count = action
+            cards = [c for c in self.hand if c.rank == rank][:count]
+
+            for card in cards:
                 self.hand.remove(card)
                 game.playing_stack.append(card)
 
-        print(f"{self.name} plays: {', '.join(str(c) for c in action)}")
-
-        # Handle special card effects
-        if action[0].rank == '2':
-            return 2 * len(action)
-        elif action[0].rank == '5':
-            return 3 * len(action)
-        elif action[0].rank == 'J':
-            forced_draws = len(action)
-            for p in game.players:
-                if p != self:
-                    for _ in range(forced_draws):
-                        p.draw_card(game.deck, game)
-            return 0
-        elif action[0].rank == '8':
-            return -len(action)
-
-        return 0
+            print(f"{self.name} plays stack: {cards}")
+            return self._handle_special(cards[0], game, count)
+        return None
 
     def learn(self, state, action, reward, next_state, game):
         """Update Q-table using q-learning"""
@@ -341,6 +344,21 @@ class SimpleRLPlayer(Player):
         # Store current state/action for next update
         self.last_state = self.get_state_key(game)
         self.last_action = self.choose_action(game) if self.hand else None
+
+    def _handle_special(self, card, game, count=1):
+        if card.rank == '2':
+            return 2 * count
+        elif card.rank == '5':
+            return 3 * count
+        elif card.rank == 'J':
+            for p in game.players:
+                if p != self:
+                    for _ in range(count):
+                        p.draw_card(game.deck, game)
+            return 0
+        elif card.rank == '8':
+            return -count
+        return 0
 
     def _bucket_hand_size(self, hand_size):
         """Bucket hand size into categories"""
@@ -838,10 +856,13 @@ class RLTrainingSystem:
             for state, actions in q_table_dict.items():
                 self.agent.q_table[state].update(actions)
 
+    # TODO: Find out why the q-table is not being saved
     def load_agent(self, filename="trained_card_player.pkl"):
         """Load a trained agent from file - FIXED VERSION"""
         with open(filename, 'rb') as f:
             data = pickle.load(f)
+
+        print("Pickle data: ", data)
 
         self.agent = data['agent']
         self.training_stats = data.get('training_stats', [])
@@ -960,7 +981,7 @@ if __name__ == "__main__":
     # Load the trained agent
     trained_agent = trainer.load_agent("trained_card_player.pkl")
     trained_agent.name = "RL_Learner"
-    trained_agent.epsilon = 0.9  # Minimal exploration for testing
+    trained_agent.epsilon = 0.05  # Minimal exploration for testing
 
     # Replace first player with trained agent
     test_game.players[0] = trained_agent
